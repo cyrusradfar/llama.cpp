@@ -1175,15 +1175,16 @@ class OutputFile:
 
             return np.concatenate(sample_indices) 
         
+
         def get_cluster_boundaries(cluster_centers):
-            boundaries = np.array([-np.inf])  # Initialize as a NumPy array 
-            # Calculate midpoints between consecutive cluster centers
+            boundaries = []  
             for i in range(len(cluster_centers) - 1):
                 midpoint = (cluster_centers[i] + cluster_centers[i + 1]) / 2
-                boundaries = np.append(boundaries, midpoint)  # Use np.append
-
-            boundaries = np.append(boundaries, np.inf)  # Append the last boundary
-            return boundaries 
+                boundaries.append(midpoint)  
+        
+            boundaries.insert(0, -np.inf)  
+            boundaries.append(np.inf)  
+            return np.sort(boundaries)  
 
         def analyze(ndarray, name, analysis_dir):
             cmap = matplotlib.colormaps.get_cmap('tab20')  # 'tab20' has 20 distinct colors
@@ -1221,7 +1222,7 @@ class OutputFile:
 
             start_time = time.time()
             sample = stratified_sample(ndarray, min(1600, int(np.size(ndarray.flat)*0.05) ), num_bins=16)
-            print(f"created stratified sample in {time.time()-start_time} sec")
+            # print(f"created stratified sample in {time.time()-start_time} sec")
 
             start_time = time.time()
             for n_clusters in range(3, 17):  # Iterate from 3 to 16
@@ -1242,9 +1243,14 @@ class OutputFile:
             plot_path = os.path.join(analysis_dir, plot_filename_cluster)
             
             plt.figure(figsize=(8, 6))  # Adjust figure size as needed
+            # Generate scatter plot with cluster assignments
+            x_values = cluster_labels.astype(float)  # Convert cluster labels to numeric for plotting
+            y_values = sample.flatten()
 
-            # Generate scatter plot of original data (flatten for 2D)
-            plt.scatter(range(len(ndarray.flatten())), ndarray.flatten(), s=5, alpha=0.5)  
+            # Add some "jitter" for better visualization (optional)
+            x_values += np.random.uniform(-0.4, 0.4, size=len(x_values))
+
+            plt.scatter(x_values, y_values, s=5, alpha=0.5)
 
             # Plot vertical boundary lines 
             for boundary in best_cluster_boundaries:
@@ -1253,9 +1259,6 @@ class OutputFile:
             # Calculate and overlay cluster histogram
             for i in range(best_n_clusters):
                 mask = (cluster_labels == i)  # Assuming cluster_labels comes from your KMeans fit
-                print("Shape of sample[mask]:", sample[mask].shape)
-                print("Shape of best_cluster_boundaries:", best_cluster_boundaries.shape)
-                print("Color being used:", colors[i])
 
                 plt.hist(sample[mask], 
                         bins=best_cluster_boundaries, 
@@ -1310,10 +1313,10 @@ class OutputFile:
                 elif stat_name == 'plot_file_cluster':
                     plot_file_cluster = stat_value
 
-            f.write("<tr><th>Distribution</th><th>Decile</th></tr>\n")
+            f.write("<tr><th>Distribution</th><th>Clusters</th></tr>\n")
             # Display the plot
             f.write(f"<tr><td><img src='{plot_file}' alt='Distribution Plot - {name}'></td>")
-            f.write(f"<td><img src='{plot_file_cluster}' alt='Distribution Plot - {name}'></td></tr>")
+            f.write(f"<td><img src='{plot_file_cluster}' alt='Clusters Plot - {name}'></td></tr>")
             f.write("</tbody></table>")            
             f.write("</hr></br>")
             f.flush()
@@ -1358,7 +1361,7 @@ class OutputFile:
                 # Write tensor analysis to the report 
                 write_tensor_report(f, name, plot_report[name])
 
-            final_analysis = analyze(sample_arr)
+            final_analysis, strat_sample = analyze(sample_arr, "ALL", analysis_dir)            
             write_tensor_report(f, "FINAL SAMPLE", final_analysis)
 
         start = time.time()
