@@ -1174,6 +1174,16 @@ class OutputFile:
                 sample_indices.append(random_samples)
 
             return np.concatenate(sample_indices) 
+        
+        def get_cluster_boundaries(cluster_centers):
+            boundaries = np.array([-np.inf])  # Initialize as a NumPy array 
+            # Calculate midpoints between consecutive cluster centers
+            for i in range(len(cluster_centers) - 1):
+                midpoint = (cluster_centers[i] + cluster_centers[i + 1]) / 2
+                boundaries = np.append(boundaries, midpoint)  # Use np.append
+
+            boundaries = np.append(boundaries, np.inf)  # Append the last boundary
+            return boundaries 
 
         def analyze(ndarray, name, analysis_dir):
             cmap = matplotlib.colormaps.get_cmap('tab20')  # 'tab20' has 20 distinct colors
@@ -1207,13 +1217,15 @@ class OutputFile:
             best_n_clusters = None
             best_silhouette = -1  # Start with a very low initial score
             cluster_labels = None
+            best_cluster_centers = None
 
-            sample = stratified_sample(ndarray, min(1600, int(np.size(ndarray.flat)*0.01) ), num_bins=16)
-            print(f"created stratified sample")
+            start_time = time.time()
+            sample = stratified_sample(ndarray, min(1600, int(np.size(ndarray.flat)*0.05) ), num_bins=16)
+            print(f"created stratified sample in {time.time()-start_time} sec")
 
             start_time = time.time()
             for n_clusters in range(3, 17):  # Iterate from 3 to 16
-                print(f"Starting clustering for {name} > {n_clusters}")
+                # print(f"Starting clustering for {name} > {n_clusters}")
                 kmeans = KMeans(n_clusters=n_clusters, random_state=0)
                 cluster_labels = kmeans.fit_predict(sample.reshape(-1, 1))  # Reshape for KMeans
                 silhouette_avg = silhouette_score(sample.reshape(-1, 1), cluster_labels)
@@ -1221,18 +1233,42 @@ class OutputFile:
                 if silhouette_avg > best_silhouette:
                     best_silhouette = silhouette_avg
                     best_n_clusters = n_clusters
+                    best_cluster_centers = kmeans.cluster_centers_  # Extract cluster centers
+                    best_cluster_boundaries = get_cluster_boundaries(best_cluster_centers)  # Implement this function
 
-                print(f"{n_clusters}: completed clustering calc for {name}: best_n={best_n_clusters}, best_sil={best_silhouette} [in {time.time()-start_time}]")
+                # print(f"{n_clusters}: completed clustering calc for {name}: best_n={best_n_clusters}, best_sil={best_silhouette} [in {time.time()-start_time}]")
 
             plot_filename_cluster = f"{name}_cluster.png"  # Or choose a different extension
             plot_path = os.path.join(analysis_dir, plot_filename_cluster)
+            
+            plt.figure(figsize=(8, 6))  # Adjust figure size as needed
 
-            plt.hist(ndarray, bins=best_n_clusters, color=colors[cluster_labels]) # Adjust bin count as needed
-            plt.title(f"{name} - Cluster Assignments")
-            plt.xlabel("Value")
-            plt.ylabel("Frequency")
+            # Generate scatter plot of original data (flatten for 2D)
+            plt.scatter(range(len(ndarray.flatten())), ndarray.flatten(), s=5, alpha=0.5)  
+
+            # Plot vertical boundary lines 
+            for boundary in best_cluster_boundaries:
+                plt.axvline(x=boundary, color='r', linestyle='dashed') 
+            
+            # Calculate and overlay cluster histogram
+            for i in range(best_n_clusters):
+                mask = (cluster_labels == i)  # Assuming cluster_labels comes from your KMeans fit
+                print("Shape of sample[mask]:", sample[mask].shape)
+                print("Shape of best_cluster_boundaries:", best_cluster_boundaries.shape)
+                print("Color being used:", colors[i])
+
+                plt.hist(sample[mask], 
+                        bins=best_cluster_boundaries, 
+                        color=colors[i], 
+                        alpha=0.5, 
+                        label=f"Cluster {i}") 
+                
+            plt.title(f"{name} - Clusters & Boundaries")
+            plt.xlabel("Data Index")  # Or a more descriptive label if applicable
+            plt.ylabel("Value")
             plt.savefig(plot_path) 
             plt.close()
+
             run_time = time.time() - start_time
 
             zeros = count_val - count_nonzero_val
@@ -1253,7 +1289,8 @@ class OutputFile:
                 'plot_file': plot_filename,                   
                 'plot_file_cluster': plot_filename_cluster,
                 'best_n_clusters': best_n_clusters,
-                'best_silhouette_score': best_silhouette 
+                'best_silhouette_score': best_silhouette,
+                'best_cluster_boundaries': best_cluster_boundaries
             }, sample
         
         def write_tensor_report(f, name, data):
