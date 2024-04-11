@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-
+import datetime
 import argparse
 import concurrent.futures
 import enum
@@ -24,6 +24,13 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, IO, Iterable, Literal, Protocol, TypeVar, runtime_checkable
+import matplotlib
+matplotlib.use("Agg")
+
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+
+import matplotlib.pyplot as plt
 
 import numpy as np
 from sentencepiece import SentencePieceProcessor
@@ -1153,6 +1160,169 @@ class OutputFile:
             )
         else:
             ndarrays = map(OutputFile.maybe_do_quantize, ndarrays_inner)
+        
+
+        def stratified_sample(ndarray, sample_size, num_bins=5):
+            bins = np.quantile(ndarray, np.linspace(0, 1, num_bins + 1)) 
+            bin_indices = np.digitize(ndarray, bins) 
+
+            sample_indices = []
+            for bin_id in range(num_bins):
+                bin_data_indices = np.where(bin_indices == bin_id)[0]  # Indices where data falls in this bin
+                num_samples_from_bin = min(sample_size // num_bins, len(bin_data_indices))  # Adjust sampling per bin
+                random_samples = np.random.choice(bin_data_indices, size=num_samples_from_bin, replace=False)
+                sample_indices.append(random_samples)
+
+            return np.concatenate(sample_indices) 
+
+        def analyze(ndarray, name, analysis_dir):
+            cmap = matplotlib.colormaps.get_cmap('tab20')  # 'tab20' has 20 distinct colors
+            colors = [cmap(i) for i in range(cmap.N)]  # Extract 16 colors
+
+            count_nonzero_val = np.count_nonzero(ndarray)
+            count_val = np.size(ndarray)
+            min_val = np.min(ndarray)
+            max_val = np.max(ndarray)
+            mean_val = np.mean(ndarray)
+            median_val = np.median(ndarray)
+            std_dev = np.std(ndarray)
+            
+            # Analysis of Frequency/Distribution
+            histogram, bin_edges = np.histogram(ndarray, bins=16)  # Adjust bin count as neede
+            
+            # Example: Plot distribution of a specific tensor
+            plt.hist(bin_edges[:-1], bin_edges, weights=histogram)
+            plt.title(f"{name}")
+            plt.xlabel("Value") 
+            plt.ylabel("Frequency")
+            plt.yscale('log')
+
+            # Save the plot
+            plot_filename = f"{name}_distribution.png"  # Or choose a different extension
+            plot_path = os.path.join(analysis_dir, plot_filename)
+            plt.savefig(plot_path) 
+            plt.close()
+
+            # K-Means Clustering and Silhouette Analysis
+            best_n_clusters = None
+            best_silhouette = -1  # Start with a very low initial score
+            cluster_labels = None
+
+            sample = stratified_sample(ndarray, min(1600, int(np.size(ndarray.flat)*0.01) ), num_bins=16)
+            print(f"created stratified sample")
+
+            start_time = time.time()
+            for n_clusters in range(3, 17):  # Iterate from 3 to 16
+                print(f"Starting clustering for {name} > {n_clusters}")
+                kmeans = KMeans(n_clusters=n_clusters, random_state=0)
+                cluster_labels = kmeans.fit_predict(sample.reshape(-1, 1))  # Reshape for KMeans
+                silhouette_avg = silhouette_score(sample.reshape(-1, 1), cluster_labels)
+
+                if silhouette_avg > best_silhouette:
+                    best_silhouette = silhouette_avg
+                    best_n_clusters = n_clusters
+
+                print(f"{n_clusters}: completed clustering calc for {name}: best_n={best_n_clusters}, best_sil={best_silhouette} [in {time.time()-start_time}]")
+
+            plot_filename_cluster = f"{name}_cluster.png"  # Or choose a different extension
+            plot_path = os.path.join(analysis_dir, plot_filename_cluster)
+
+            plt.hist(ndarray, bins=best_n_clusters, color=colors[cluster_labels]) # Adjust bin count as needed
+            plt.title(f"{name} - Cluster Assignments")
+            plt.xlabel("Value")
+            plt.ylabel("Frequency")
+            plt.savefig(plot_path) 
+            plt.close()
+            run_time = time.time() - start_time
+
+            zeros = count_val - count_nonzero_val
+            
+            return {
+                'cluster_calc_time_sec': run_time,
+                'count_nonzero': count_nonzero_val,
+                'zeros': zeros,
+                'count': count_val,
+                'zero_percent': (zeros/count_val * 100),
+                'min': min_val,
+                'max': max_val,
+                'mean': mean_val,
+                'median': median_val,
+                'std_dev': std_dev,
+                'histogram': histogram,
+                'bin_edges': bin_edges,
+                'plot_file': plot_filename,                   
+                'plot_file_cluster': plot_filename_cluster,
+                'best_n_clusters': best_n_clusters,
+                'best_silhouette_score': best_silhouette 
+            }, sample
+        
+        def write_tensor_report(f, name, data):
+            """Writes the analysis for a single tensor to an open HTML file."""
+
+            f.write(f"<h2>Tensor: {name}</h2>\n")
+
+            plot_file_cluster = plot_file = None
+            # Table of statistics
+            f.write("<table><thead>")
+            f.write("<tr><th>Statistic</th><th>Value</th></tr></thead><tbody>\n")
+            for stat_name, stat_value in data.items():
+                if not stat_name.startswith('plot_file'): 
+                    f.write(f"<tr><td>{stat_name}</td><td>{stat_value}</td></tr>\n")
+                elif stat_name == 'plot_file':
+                    plot_file = stat_value
+                elif stat_name == 'plot_file_cluster':
+                    plot_file_cluster = stat_value
+
+            f.write("<tr><th>Distribution</th><th>Decile</th></tr>\n")
+            # Display the plot
+            f.write(f"<tr><td><img src='{plot_file}' alt='Distribution Plot - {name}'></td>")
+            f.write(f"<td><img src='{plot_file_cluster}' alt='Distribution Plot - {name}'></td></tr>")
+            f.write("</tbody></table>")            
+            f.write("</hr></br>")
+            f.flush()
+
+
+        analysis_dir = "models/analysis"
+        report_name = "report.html"
+        os.makedirs(analysis_dir, exist_ok=True)
+        plot_report = {}
+        start = time.time()
+
+        total_left = total_items = len(model)
+
+        sample_arr = np.array([])
+
+         # Open the HTML report for writing
+        with open(os.path.join(analysis_dir, report_name), "w") as f:
+            f.write("<h1>Model Analysis Report</h1>\n")
+        
+            # let's analyze the model weights and produce a plot for each layer
+            for i, ((name, lazy_tensor), ndarray) in enumerate(zip(model.items(), ndarrays)):
+                start_iter = time.time()
+                # Statistical Analysis 
+  
+                plot_report[name], strat_sample = analyze(ndarray, name, analysis_dir)
+                sample_arr = np.append(sample_arr, strat_sample) # Sample without replacement               
+              
+                now = time.time()
+                elapsed_total = int(now - start)
+                elapsed_loop = int(now - start_iter)
+                total_left -= 1
+                items_processed = total_items - total_left
+                time_per_item = elapsed_total / items_processed  # Time taken per processed item (in seconds)
+                percent_done = int(((items_processed) / total_items) * 100)
+
+                # Assuming total_items represents the total number of tensors to process
+                estimated_time_left = time_per_item * total_left * 1.15  # Estimated total time remaining (in seconds)
+                estimated_completion_time = datetime.datetime.now() + datetime.timedelta(seconds=estimated_time_left)
+
+                print(f"{percent_done}% : {name} in {elapsed_loop} sec [+{elapsed_total} sec total, Est. Finish: {estimated_completion_time.strftime('%H:%M')}]")
+            
+                # Write tensor analysis to the report 
+                write_tensor_report(f, name, plot_report[name])
+
+            final_analysis = analyze(sample_arr)
+            write_tensor_report(f, "FINAL SAMPLE", final_analysis)
 
         start = time.time()
         for i, ((name, lazy_tensor), ndarray) in enumerate(zip(model.items(), ndarrays)):
