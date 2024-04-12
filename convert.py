@@ -1055,6 +1055,27 @@ def check_vocab_size(params: Params, vocab: BaseVocab, pad_vocab: bool = False) 
 
     raise ValueError(msg)
 
+__COLOR_MAP = None
+
+@staticmethod
+def get_colors():
+    global __COLOR_MAP
+
+    if __COLOR_MAP is None:
+        import matplotlib.colors as mcolors
+
+        cmap1 = matplotlib.colormaps['tab20']  # Use half of 'tab20'
+        cmap2 = matplotlib.colormaps['tab20b']        
+
+        # Normalize values for smooth concatenation
+        cmap1_new = mcolors.LinearSegmentedColormap.from_list("", cmap1(np.linspace(0, 0.5, 20)))
+        cmap2_new = mcolors.LinearSegmentedColormap.from_list("", cmap2(np.linspace(0.5, 1, 20)))
+
+        colors = cmap1_new(np.linspace(0, 1, 40))
+        __COLOR_MAP = colors
+
+    return __COLOR_MAP
+
 
 class OutputFile:
     def __init__(self, fname_out: Path, endianess:gguf.GGUFEndian = gguf.GGUFEndian.LITTLE):
@@ -1151,6 +1172,9 @@ class OutputFile:
     def write_tensor_info(self) -> None:
         self.gguf.write_ti_data_to_file()
 
+
+
+
     def write_tensor_data(self, ftype: GGMLFileType, model: LazyModel, concurrency: int) -> None:
         ndarrays_inner = bounded_parallel_map(OutputFile.do_item, model.items(), concurrency=concurrency)
         if ftype == GGMLFileType.MostlyQ8_0:
@@ -1163,32 +1187,37 @@ class OutputFile:
         
 
         def stratified_sample(ndarray, sample_size, num_bins=5):
-            bins = np.quantile(ndarray, np.linspace(0, 1, num_bins + 1)) 
-            bin_indices = np.digitize(ndarray, bins) 
+            flat_data = ndarray.flatten()
+
+            bins = np.quantile(flat_data, np.linspace(0, 1, num_bins + 1)) 
+            bin_indices = np.digitize(flat_data, bins) 
+
+             # Calculate samples per bin based on total sample size
+            samples_per_bin = sample_size // num_bins
 
             sample_indices = []
             for bin_id in range(num_bins):
                 bin_data_indices = np.where(bin_indices == bin_id)[0]  # Indices where data falls in this bin
-                num_samples_from_bin = min(sample_size // num_bins, len(bin_data_indices))  # Adjust sampling per bin
+                num_samples_from_bin = min(samples_per_bin, len(bin_data_indices))  # Adjust sampling per bin
                 random_samples = np.random.choice(bin_data_indices, size=num_samples_from_bin, replace=False)
                 sample_indices.append(random_samples)
 
-            return np.concatenate(sample_indices) 
+            sample_indices = np.concatenate(sample_indices) 
+            ret = flat_data[sample_indices]
+            return ret
         
 
         def get_cluster_boundaries(cluster_centers):
-            boundaries = []  
+            boundaries = np.array([-np.inf])  # Initialize as a NumPy array 
             for i in range(len(cluster_centers) - 1):
                 midpoint = (cluster_centers[i] + cluster_centers[i + 1]) / 2
-                boundaries.append(midpoint)  
-        
-            boundaries.insert(0, -np.inf)  
-            boundaries.append(np.inf)  
-            return np.sort(boundaries)  
+                boundaries = np.append(boundaries, midpoint)  # Use np.append
 
-        def analyze(ndarray, name, analysis_dir):
-            cmap = matplotlib.colormaps.get_cmap('tab20')  # 'tab20' has 20 distinct colors
-            colors = [cmap(i) for i in range(cmap.N)]  # Extract 16 colors
+            boundaries = np.append(boundaries, np.inf)  # Append the last boundary
+            return np.sort(boundaries)
+
+        def analyze(ndarray, name, analysis_dir):            
+            colors = get_colors()
 
             count_nonzero_val = np.count_nonzero(ndarray)
             count_val = np.size(ndarray)
@@ -1225,7 +1254,8 @@ class OutputFile:
             # print(f"created stratified sample in {time.time()-start_time} sec")
 
             start_time = time.time()
-            for n_clusters in range(3, 17):  # Iterate from 3 to 16
+            # sample = sample.reshape(-1, 1)
+            for n_clusters in range(3, 32):  # Iterate from 2 to 16
                 # print(f"Starting clustering for {name} > {n_clusters}")
                 kmeans = KMeans(n_clusters=n_clusters, random_state=0)
                 cluster_labels = kmeans.fit_predict(sample.reshape(-1, 1))  # Reshape for KMeans
@@ -1241,17 +1271,7 @@ class OutputFile:
 
             plot_filename_cluster = f"{name}_cluster.png"  # Or choose a different extension
             plot_path = os.path.join(analysis_dir, plot_filename_cluster)
-            
-            plt.figure(figsize=(8, 6))  # Adjust figure size as needed
-            # Generate scatter plot with cluster assignments
-            x_values = cluster_labels.astype(float)  # Convert cluster labels to numeric for plotting
-            y_values = sample.flatten()
-
-            # Add some "jitter" for better visualization (optional)
-            x_values += np.random.uniform(-0.4, 0.4, size=len(x_values))
-
-            plt.scatter(x_values, y_values, s=5, alpha=0.5)
-
+        
             # Plot vertical boundary lines 
             for boundary in best_cluster_boundaries:
                 plt.axvline(x=boundary, color='r', linestyle='dashed') 
@@ -1267,8 +1287,8 @@ class OutputFile:
                         label=f"Cluster {i}") 
                 
             plt.title(f"{name} - Clusters & Boundaries")
-            plt.xlabel("Data Index")  # Or a more descriptive label if applicable
-            plt.ylabel("Value")
+            plt.xlabel("Value")  # Or a more descriptive label if applicable
+            plt.ylabel("Frequency")
             plt.savefig(plot_path) 
             plt.close()
 
@@ -1277,7 +1297,8 @@ class OutputFile:
             zeros = count_val - count_nonzero_val
             
             return {
-                'cluster_calc_time_sec': run_time,
+                'shape': ndarray.shape,
+                'cluster_calc_time_sec': int(run_time),
                 'count_nonzero': count_nonzero_val,
                 'zeros': zeros,
                 'count': count_val,
@@ -1287,40 +1308,107 @@ class OutputFile:
                 'mean': mean_val,
                 'median': median_val,
                 'std_dev': std_dev,
-                'histogram': histogram,
-                'bin_edges': bin_edges,
+                'freq_table': {
+                    'table': {
+                        'header': ['freq', 'value'],
+                        'data': [histogram, bin_edges] 
+                    }
+                },
                 'plot_file': plot_filename,                   
                 'plot_file_cluster': plot_filename_cluster,
                 'best_n_clusters': best_n_clusters,
+                'best_cluster_centers': best_cluster_centers,
                 'best_silhouette_score': best_silhouette,
                 'best_cluster_boundaries': best_cluster_boundaries
             }, sample
         
+        
+        def render_value(stat_value):
+            """Renders the value based on its data type""" 
+            if isinstance(stat_value, str):
+                return stat_value  # Strings displayed as-is 
+            elif isinstance(stat_value, int):
+                return str(stat_value)
+            elif isinstance(stat_value, float):
+                return f"{stat_value:.4f}"  # Numbers with formatting
+            elif isinstance(stat_value, np.ndarray):
+                # Here you have flexibility:
+                stat_value = stat_value.flatten()
+                if stat_value.size == 1:
+                    return render_value(stat_value[0])
+                elif stat_value.size <= 6:  
+                    return ", ".join(render_value(x) for x in stat_value.tolist())  # Small array as comma-separated list
+                else:
+                    # render as table with rows of six
+                    values = stat_value.tolist()
+                    out = ["<table><tbody>"]
+                    i = 0
+                    for v in values:
+                        if i % 5 == 0:
+                            if i > 0:
+                                out.append("</tr><tr>")
+                            else:
+                                out.append("<tr>")
+                        out.append(f"<td>{render_value(v)}</td>")
+                        i += 1
+                    out.append("</tbody></table>")
+                    return "".join(out)
+            elif isinstance(stat_value, dict) and 'table' in stat_value:                
+                # render as sub-table
+                table = stat_value['table']
+                header = table['header']
+                data = table['data']
+                col1 = data[0]
+                col2 = data[1]
+                out = f'<table><tbody><tr><th>{header[0]}</th><th>{header[1]}</th></tr>'
+                row_color = "#ffffff"
+                for i, val in enumerate(col1):
+                    r1i = render_value(val)
+                    r2i = render_value(col2[i])
+                    row_color = '#dfdfdf' if row_color == '#ffffff' else '#ffffff'
+                    out += f"<tr bgcolor=\"{row_color}\"><td>{i}</td><td>{r1i}</td><td>{r2i}</td></tr>"
+
+                out += '</tbody></table>'
+                return out
+
+            else:
+                return str(stat_value)  # Fallback: convert to string
+
         def write_tensor_report(f, name, data):
             """Writes the analysis for a single tensor to an open HTML file."""
 
-            f.write(f"<h2>Tensor: {name}</h2>\n")
+            f.write(f"<div style=\"border:1px solid #ccc; margin-bottom: 40px;\"><h2>Tensor: {name}</h2>\n")
 
             plot_file_cluster = plot_file = None
             # Table of statistics
             f.write("<table><thead>")
             f.write("<tr><th>Statistic</th><th>Value</th></tr></thead><tbody>\n")
+            row_color = "#dfdfdf"
             for stat_name, stat_value in data.items():
                 if not stat_name.startswith('plot_file'): 
-                    f.write(f"<tr><td>{stat_name}</td><td>{stat_value}</td></tr>\n")
+                    # render based on stat_value type
+                    # It's either a string, numpy number or numpy array
+                    v = render_value(stat_value)                    
+                    if row_color == "#ffffff":
+                        row_color = "#dfdfdf"
+                    else:
+                        row_color = "#ffffff"
+
+                    f.write(f"<tr bgcolor=\"{row_color}\"><td>{stat_name}</td><td>{v}</td></tr>\n")
                 elif stat_name == 'plot_file':
                     plot_file = stat_value
                 elif stat_name == 'plot_file_cluster':
                     plot_file_cluster = stat_value
 
-            f.write("<tr><th>Distribution</th><th>Clusters</th></tr>\n")
             # Display the plot
-            f.write(f"<tr><td><img src='{plot_file}' alt='Distribution Plot - {name}'></td>")
-            f.write(f"<td><img src='{plot_file_cluster}' alt='Clusters Plot - {name}'></td></tr>")
-            f.write("</tbody></table>")            
-            f.write("</hr></br>")
-            f.flush()
+            if plot_file and plot_file_cluster:
+                f.write("<tr><th>Distribution</th><th>Clusters</th></tr>\n")
+                f.write(f"<tr><td><img src='{plot_file}' alt='Distribution Plot - {name}'></td>")
+                f.write(f"<td><img src='{plot_file_cluster}' alt='Clusters Plot - {name}'></td></tr>")
 
+            f.write("</tbody></table>")            
+            f.write("</div>")
+            f.flush()
 
         analysis_dir = "models/analysis"
         report_name = "report.html"
@@ -1331,17 +1419,44 @@ class OutputFile:
         total_left = total_items = len(model)
 
         sample_arr = np.array([])
+        all_stats = {
+            'min': np.zeros(total_left),
+            'max': np.zeros(total_left),
+            'mean': np.zeros(total_left),
+            'median': np.zeros(total_left),
+            'count': np.zeros(total_left),
+            'zeros': np.zeros(total_left),
+            'std_dev': np.zeros(total_left),         
+        }
 
          # Open the HTML report for writing
+        iter = 0
         with open(os.path.join(analysis_dir, report_name), "w") as f:
-            f.write("<h1>Model Analysis Report</h1>\n")
-        
+            f.write("""<html><head><style type="text/css">table, th, td {
+  border: 1px solid #cfcfcf;
+  border-collapse: collapse;
+}
+</style></head><body>""")
+            f.write("<div style='margin: auto 10px;padding:10px'><h1>Model Analysis Report</h1>\n")
+            
+            quick_processing = False
+            allowed_processing = [1,3,7]
+
             # let's analyze the model weights and produce a plot for each layer
             for i, ((name, lazy_tensor), ndarray) in enumerate(zip(model.items(), ndarrays)):
+                if quick_processing and not i in allowed_processing:
+                    continue 
+
                 start_iter = time.time()
                 # Statistical Analysis 
   
-                plot_report[name], strat_sample = analyze(ndarray, name, analysis_dir)
+                t, strat_sample = analyze(ndarray, name, analysis_dir)
+                for key in all_stats:
+                    all_stats[key][iter] = t[key]
+
+                plot_report[name] = t
+
+                # max / min / mean / median set
                 sample_arr = np.append(sample_arr, strat_sample) # Sample without replacement               
               
                 now = time.time()
@@ -1356,13 +1471,39 @@ class OutputFile:
                 estimated_time_left = time_per_item * total_left * 1.15  # Estimated total time remaining (in seconds)
                 estimated_completion_time = datetime.datetime.now() + datetime.timedelta(seconds=estimated_time_left)
 
-                print(f"{percent_done}% : {name} in {elapsed_loop} sec [+{elapsed_total} sec total, Est. Finish: {estimated_completion_time.strftime('%H:%M')}]")
+                print(f"| {iter} | {percent_done}% : {name} in {elapsed_loop} sec [+{elapsed_total} sec total, Est. Finish: {estimated_completion_time.strftime('%H:%M')}]")
             
                 # Write tensor analysis to the report 
                 write_tensor_report(f, name, plot_report[name])
+                iter += 1
 
             final_analysis, strat_sample = analyze(sample_arr, "ALL", analysis_dir)            
             write_tensor_report(f, "FINAL SAMPLE", final_analysis)
+            write_tensor_report(f, "ALL STATS", all_stats)
+            f.write("</div></body></html>")
+
+        import json
+
+        def handle_numpy(data):
+            if isinstance(data, np.ndarray):
+                return handle_numpy(data.tolist())  # Convert NumPy arrays to Python lists
+            if isinstance(data, (np.float32, np.float16)):
+                return float(data)
+            if isinstance(data, int):
+                return int(data)
+            if isinstance(data, list):
+                return [handle_numpy(v) for v in data]
+
+            if isinstance(data, dict):
+                return {key: handle_numpy(val) for key, val in data.items()}  # Handle nested objects
+            
+            return data
+
+        # write the plot_report json to file
+        processed_dict = handle_numpy(plot_report)  # Preprocess for NumPy arrays
+        metrics_file_name = os.path.join(analysis_dir, 'metrics.json')
+        with open(metrics_file_name, 'w') as outfile:
+            json.dump(processed_dict, outfile, indent=4)  # Indent for readability
 
         start = time.time()
         for i, ((name, lazy_tensor), ndarray) in enumerate(zip(model.items(), ndarrays)):
